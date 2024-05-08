@@ -3,6 +3,10 @@
    SPDX-License-Identifier: ISC
   ---------------------------------------------------------------------------*)
 
+module Caml = struct
+  module Env = Env
+end
+
 open Down_std
 
 (* Access toploop API functionality regardless of ocaml or ocamlnat.
@@ -877,12 +881,9 @@ let help () =
   in
   pp_help Format.std_formatter ()
 
-(* Completion and doc lookup via ocp-index *)
+(* Completion and doc lookup *)
 
-module Ocp_index = struct
-  (* FIXME. POC hack via ocp-index, we likely want to that ourselves since we
-     also need to peek in the OCaml toplevel symtable to be able to
-     complete what the user defined and keep track of [open]s. *)
+module Completion = struct
 
   module Ctrie = Trie.Make (Char)
 
@@ -894,16 +895,6 @@ module Ocp_index = struct
     let b = Buffer.create 255 in
     List.iter (Buffer.add_char b) l; (Buffer.contents b)
 
-  let has_ocp_index =
-    lazy begin match Cmd.exists ["ocp-index"] with
-    | Error _ as e -> e
-    | Ok true -> Ok ()
-    | Ok false ->
-        Error (Fmt.str "Completion and doc lookup needs ocp-index. Try '%a'."
-                 pp_code "opam install ocp-index")
-    end
-
-  let complete_cmd token = ["ocp-index"; "complete"; "-f"; "%q \t %t"; token ]
   let complete_word word results =
     let add_id acc r =
       let id = String.trim (List.hd (String.split_on_char '\t' r)) in
@@ -924,45 +915,142 @@ module Ocp_index = struct
       then w ^ "." (* Likely Module name path segment. *)
       else w ^ " " (* Likely Module structure item segment. *)
 
+  let parse_longident w =
+    let rec loop lid w = match lid, w with
+    | _, [] -> assert false
+    | lid, [id] -> lid, id
+    | Some lid, s :: l -> loop (Some (Longident.Ldot (lid, s))) l
+    | None, s :: l -> loop (Some (Longident.Lident s)) l
+    in
+    loop None (String.split_on_char '.' w)
+
+  let lookup_env f x env = match f x env with
+  | r -> Some r
+  | exception (Not_found | Caml.Env.Error _) -> None
+
+  module M = Map.Make(String)
+
+  let rec list_global_names () =
+    let rec loop acc = function
+    | Caml.Env.Env_empty -> acc
+    | Env_value_unbound _-> acc
+    | Env_module_unbound _-> acc
+    | Env_value(summary, id, {Types.val_type}) ->
+        loop (M.add (Ident.name id) (Some val_type) acc) summary
+    | Env_type(summary, id, decl) ->
+        loop (add_names_of_type decl acc) summary
+    | Env_module(summary, id, _, _) ->
+        loop (M.add (Ident.name id) None acc) summary
+    | Env_extension(summary, _, _)
+    | Env_modtype(summary, _, _)
+    | Env_class(summary, _, _)
+    | Env_cltype(summary, _, _)
+    | Env_functor_arg(summary, _)
+    | Env_constraints (summary, _)
+    | Env_copy_types summary ->
+        loop acc summary
+    | Env_persistent (summary, id) ->
+        loop (M.add (Ident.name id) None acc) summary
+    | Env_open(summary, path) ->
+        begin match lookup_env Caml.Env.find_module path !Toploop.toplevel_env with
+        | Some {Types.md_type} ->
+            let names = names_of_module_type md_type in
+            loop (M.union (fun _ a _ -> Some a) acc names) summary
+        | None ->
+            loop acc summary
+        end
+    in
+    loop M.empty (Caml.Env.summary !Toploop.toplevel_env)
+
+  and add_names_of_type decl acc = match decl.Types.type_kind with
+  | Type_variant (cstrs, _) ->
+      List.fold_left (fun acc {Types.cd_id; cd_res} ->
+          M.add (Ident.name cd_id) cd_res acc
+        ) acc cstrs
+  | Type_record (flds, _) ->
+      List.fold_left (fun acc {Types.ld_id; ld_type} ->
+          M.add (Ident.name ld_id) (Some ld_type) acc
+        ) acc flds
+  | Type_abstract | Type_open ->
+      acc
+
+  and names_of_module_type = function
+  | Types.Mty_signature decls ->
+      List.fold_left
+        (fun acc decl -> match decl with
+          | Types.Sig_value (id, {Types.val_type}, _) ->
+              M.add (Ident.name id) (Some val_type) acc
+          | Sig_type (_, decl, _, _) ->
+              add_names_of_type decl acc
+          | Sig_typext (id, _, _, _)
+          | Sig_module (id, _, _, _, _)
+          | Sig_modtype (id, _, _)
+          | Sig_class (id, _, _, _)
+          | Sig_class_type (id, _, _, _) ->
+              M.add (Ident.name id) None acc) M.empty decls
+  | Mty_ident path ->
+      begin match lookup_env Caml.Env.find_modtype path !Toploop.toplevel_env with
+      | Some {mtd_type = None} | None -> M.empty
+      | Some {mtd_type = Some module_type} -> names_of_module_type module_type
+      end
+  | Mty_alias path ->
+      begin match lookup_env Caml.Env.find_module path !Toploop.toplevel_env with
+      | None -> M.empty
+      | Some {Types.md_type} -> names_of_module_type md_type
+      end
+  | _ ->
+      M.empty
+
   let id_complete = function
   | "" -> Ok ("", [])
   | w ->
-      Result.bind (Lazy.force has_ocp_index) @@ fun () ->
-      Result.bind (Result.map_error snd @@ Cmd.read (complete_cmd w)) @@
-      fun s -> match List.rev (Txt.lines s) with
-      | [] | [""] | [""; ""] -> Ok (w, [])
-      | "" :: rlines | rlines ->
-          match complete_word w (List.rev rlines) with
-          | w, ([_] as cs) -> Ok (finish_single_complete w, cs)
-          | _ as ret -> Ok ret
+      let lid, id, names =
+        match parse_longident w with
+        | None, id ->
+            [], id, list_global_names ()
+        | Some lid, id ->
+            Longident.flatten lid, id,
+            match lookup_env Caml.Env.find_module_by_name lid !Toploop.toplevel_env with
+            | None -> M.empty
+            | Some (_, {md_type}) ->
+                names_of_module_type md_type
+      in
+      let names =
+        M.filter_map (fun name te ->
+            if String.starts_with ~prefix:id name then
+              let lid = String.concat "." (lid @ [name]) in
+              let te = match te with None -> "" | Some te -> Format.asprintf "%a" Printtyp.type_expr te in
+              Some (Printf.sprintf "%s \t %s" lid te)
+            else None
+          ) names
+      in
+      match complete_word w (List.map snd (M.bindings names)) with
+      | w, ([_] as cs) -> Ok (finish_single_complete w, cs)
+      | _ as ret -> Ok ret
 
-  let print_cmd id = ["ocp-index"; "print"; id; "%q \\t %t\\n(**)\\n%d" ]
-  let parse_id_info = function
-  | "" -> None
-  | o ->
-      match Txt_entries.of_string ~sep:"(**)" o with
-      | [] -> None
-      | [v] -> Some (v, "", "")
-      | (id_sig :: doc :: _) ->
-          match String.index id_sig '\t' with
-          | exception Not_found -> Some (o, "", doc)
-          | i ->
-              let len = String.length id_sig in
-              let id = String.sub id_sig 0 i in
-              let typ =
-                if i + 1 = len then "" else
-                String.sub id_sig (i + 1) (len - (i + 1))
-              in
-              Some (id, typ, doc)
-
+  (* Unfortunately, this simple code requires that [.cmi] files be compiled
+     using [-keep-docs].  To make it work in general, one needs to look into
+     [.cmt] files. *)
   let id_info = function
   | "" -> Ok None
   | id ->
-      Result.bind (Lazy.force has_ocp_index) @@ fun () ->
-      match (Cmd.read (print_cmd id)) with
-      | Error (2, _) -> Ok None
-      | Error (n, e) -> Error e
-      | Ok o -> Ok (parse_id_info o)
+      let lid = match parse_longident id with
+        | None, id -> Longident.Lident id
+        | Some lid, id -> Ldot (lid, id)
+      in
+      match lookup_env Caml.Env.find_value_by_name lid !Toploop.toplevel_env with
+      | None -> Ok None
+      | Some (path, {Types.val_type; val_attributes}) ->
+          let doc =
+            List.find_map (function
+              | {Parsetree.attr_name = {txt = "ocaml.doc"};
+                 attr_payload =
+                   PStr[{pstr_desc = Pstr_eval({pexp_desc = Pexp_constant(Pconst_string(s, _, _))}, _)}]} ->
+                  Some (String.concat "\n" (List.map String.trim (String.split_on_char '\n' s)))
+              | _ -> None) val_attributes
+          in
+          let doc = Option.value ~default:"" doc in
+          Ok (Some (id ^ " ", Format.asprintf " %a" Printtyp.type_expr val_type, doc))
 end
 
 (* Toplevel readline *)
@@ -1019,8 +1107,8 @@ let install_down () =
   original_ocaml_readline := !Top.read_interactive_input;
   match line_edition with
   | Ok () ->
-      let id_complete = Ocp_index.id_complete in
-      let id_info = Ocp_index.id_info in
+      let id_complete = Completion.id_complete in
+      let id_info = Completion.id_info in
       let p = Prompt.create ~id_complete ~id_info ~readc:Stdin.readc () in
       Top.read_interactive_input := down_readline p;
       install_sigwinch_interrupt ();
